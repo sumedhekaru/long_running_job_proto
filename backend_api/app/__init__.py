@@ -8,5 +8,7 @@ app = FastAPI(
     version="0.1.0"
 )
 
-# Import routes after app initialization to avoid circular imports
-from . import routes  # noqa
+# Import and include API routes
+from .routes import router
+app.include_router(router)
+

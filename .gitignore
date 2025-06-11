@@ -81,6 +81,3 @@ forecast_data/
 
 # Ignore compiled Prophet models
 *.stan
-
-#other
-what_we_did.md
