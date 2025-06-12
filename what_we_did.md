@@ -50,4 +50,19 @@
 
 ---
 
+
+---
+
+## Step 6: Backend Refactor for Batch Forecasting (June 2025)
+- Refactored the FastAPI backend to fully support batch-based forecasting jobs:
+    - Implemented `/jobs/batch` endpoint to accept `job_id` and `batch_id` for batch processing.
+    - Backend now fetches batch items and their sales history directly from the database, not from the frontend.
+    - Forecasting for items in a batch is parallelized using `ProcessPoolExecutor` for efficient, scalable processing.
+    - Batch status is tracked in the database and updated at every key stage (submitted, obtaining sales, processing, completed, failed, etc.).
+    - Used a PostgreSQL connection pool (`psycopg2.pool.SimpleConnectionPool`) for efficient DB access and resource management.
+    - All forecast results are upserted into the `fcst_app.forecasts` table in a single batch operation.
+    - Robust error handling: batch status is updated to 'failed' on any error, and errors are logged for debugging.
+    - Removed all legacy endpoints and in-memory job logic from the backend for clarity and maintainability.
+    - The backend is now fully DB-driven, scalable, and ready for integration with the batch-oriented frontend.
+
 Further steps and decisions will be documented here as the project progresses.

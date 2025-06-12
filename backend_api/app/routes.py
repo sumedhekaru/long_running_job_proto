@@ -1,19 +1,20 @@
-from fastapi import APIRouter, HTTPException, status, BackgroundTasks
-from fastapi.responses import JSONResponse
-from typing import List, Dict, Any
-from pydantic import BaseModel
-from datetime import datetime
+from fastapi import APIRouter, HTTPException, status, Request
+from typing import List
 from enum import Enum
-import concurrent.futures
 import pandas as pd
-import os
 import time
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import pool
 
 router = APIRouter()
 
-# Temporary in-memory storage for demo
-jobs_db: Dict[str, Dict[str, Any]] = {}
+# --- Initialize a connection pool at module level ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+db_pool = psycopg2.pool.SimpleConnectionPool(minconn=1, maxconn=10, dsn=DATABASE_URL)
 
+# --- Helper Enums and Forecast Function ---
 class JobStatus(str, Enum):
     QUEUED = "queued"
     PROCESSING = "processing"
@@ -21,28 +22,16 @@ class JobStatus(str, Enum):
     FAILED = "failed"
     STOPPED = "stopped"
 
-class JobRequest(BaseModel):
-    user_id: str
-    items: List[dict]  # List of items to forecast
-    forecast_horizon: int = 30  # Default 30 days forecast
-
-class JobResponse(BaseModel):
-    job_id: str
-    status: JobStatus
-    created_at: datetime
-    user_id: str
-    forecast_horizon: int
-    items_count: int
-
 def forecast_one_item(item, forecast_horizon):
+    """
+    Run Prophet forecasting for a single item. Expects item dict with 'item_nbr' and 'history'.
+    """
     from prophet import Prophet
-    import time
-    item_id = item["item_id"]
+    item_id = item["item_nbr"]
     history = item["history"]
     start = time.time()
     df = pd.DataFrame(history)
     df["ds"] = pd.to_datetime(df["ds"])
-    # Use all available history for each item
     df = df.sort_values("ds")
     print(f"[FastAPI] Forecasting item {item_id} with {len(df)} data points.")
     model = Prophet(yearly_seasonality=False)
@@ -53,114 +42,143 @@ def forecast_one_item(item, forecast_horizon):
     duration = time.time() - start
     print(f"[FastAPI] Forecast for item {item_id} took {duration:.2f} seconds.")
     return {
-        "item_id": item_id,
+        "item_nbr": item_id,
         "forecast": forecast_needed.to_dict(orient="records")
     }
+    
+def update_batch_status(batch_id, status,cursor=None):
+    """`
+    Update the status of a batch in the database using the connection pool.
+    """
+    if cursor is None:
+        new_conn = True
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
 
-def run_forecasting_background(job_id, job_request_dict):
-    print(f"[FastAPI] Background forecasting started for job {job_id}")
-    job = jobs_db[job_id]
+    cursor.execute("""
+            UPDATE fcst_app.batch_status
+            SET status = %s, updated_at = NOW()
+            WHERE batch_id = %s
+        """, (status, batch_id))
+    cursor.connection.commit()
+
+    if new_conn:
+        cursor.close()
+        db_pool.putconn(conn)
+
+
+# --- New Batch Submission Endpoint ---
+@router.post("/jobs/batch")
+async def submit_batch(request: Request):
+    """
+    Accepts a batch submission with job_id and batch_id.
+    Fetches items for the batch, retrieves their sales history, runs forecasting,
+    and returns the results. Prints/logs key steps for learning/debugging.
+    """
+    data = await request.json()
+    job_id = data.get("job_id")
+    batch_id = data.get("batch_id")
+    forecast_horizon = data.get("forecast_horizon", 30)
+    conn = db_pool.getconn()
+    update_batch_status(batch_id, "Submitted.",conn)
+    print(f"[FastAPI] Received batch submission: job_id={job_id}, batch_id={batch_id}")
+
     try:
-        job["status"] = JobStatus.PROCESSING
-        items = job_request_dict["items"]
-        forecast_horizon = job_request_dict["forecast_horizon"]
-        num_workers = os.cpu_count() or 1
-        print(f"[FastAPI] Parallel forecasting for {len(items)} items using {num_workers} workers...")
-        total_start = time.time()
-        job["progress"] = {"done": 0, "total": len(items)}
-        job["log"] = []
+        # 1. Get sales history for all items in the batch
+        df_hist = get_sales_history(job_id, batch_id)   
+
+        # Prepare batch items for parallel processing
+        batch_items = []
+        for item_nbr in df_hist["item_nbr"].unique():
+            item_hist = df_hist[df_hist["item_nbr"] == item_nbr][["ds", "y"]]
+            history = item_hist.to_dict(orient="records")
+            batch_items.append({"item_nbr": item_nbr, "history": history})
+
+        print(f"[FastAPI] Running parallel forecasting for batch {batch_id}...")
+        import concurrent.futures
+        forecasts = []
+        num_workers = min(os.cpu_count() or 1, len(batch_items))
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(forecast_one_item, item, forecast_horizon) for item in items]
-            forecasts = []
-            for idx, future in enumerate(concurrent.futures.as_completed(futures)):
-                # Check for cancellation before processing each result
-                if job["status"] == JobStatus.STOPPED:
-                    cancel_msg = f"Job {job_id} cancelled by user after {idx} of {len(items)} items."
-                    print(f"[FastAPI] {cancel_msg}")
-                    job["log"].append(cancel_msg)
-                    job["status"] = JobStatus.STOPPED
-                    break
+            future_to_item = {
+                executor.submit(forecast_one_item, item, forecast_horizon): item["item_nbr"]
+                for item in batch_items
+            }
+            for future in concurrent.futures.as_completed(future_to_item):
+                item_nbr = future_to_item[future]
                 try:
                     result = future.result()
-                    msg = f"Forecast completed for item {result['item_id']} ({idx+1}/{len(items)})"
-                    print(f"[FastAPI] {msg}")
                     forecasts.append(result)
-                    job["progress"]["done"] = idx + 1
-                    job["log"].append(msg)
                 except Exception as e:
-                    err_msg = f"Forecast failed for one item: {e}"
-                    print(f"[FastAPI] {err_msg}")
-                    job["log"].append(err_msg)
-        # Only mark as completed if not cancelled
-        if job["status"] != JobStatus.STOPPED:
-            total_duration = time.time() - total_start
-            job["forecasts"] = forecasts
-            job["status"] = JobStatus.COMPLETED
-            done_msg = f"Job {job_id} completed successfully in {total_duration:.2f} seconds."
-            print(f"[FastAPI] {done_msg}")
-            job["log"].append(done_msg)
+                    print(f"[FastAPI] Forecast failed for item {item_nbr}: {e}")
+                    forecasts.append({"item_nbr": item_nbr, "error": str(e)})
+
+        update_batch_status(batch_id, "Completed",cur)
+        print(f"[FastAPI] Completed forecasting for batch {batch_id}.")
+
+        update_forecasts(forecasts)
+        return {"batch_id": batch_id, "forecasts": forecasts}
     except Exception as e:
-        job["status"] = JobStatus.FAILED
-        job["error"] = str(e)
-        err_msg = f"Job {job_id} failed: {e}"
-        print(f"[FastAPI] {err_msg}")
-        job["log"].append(err_msg)
+        update_batch_status(batch_id, "Failed")
+        print(f"[FastAPI] Error forecasting for batch {batch_id}: {e}")
+        return {"batch_id": batch_id, "error": str(e)}
 
+def get_sales_history(job_id, batch_id):
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            update_batch_status(batch_id, "Obtaining sales history",cur)
+            df_hist = pd.read_sql("""
+                SELECT item_nbr, wk_end_dt AS ds, unit_sales AS y 
+                FROM fcst_app.sales
+                join fcst_app.job_items 
+                ON fcst_app.sales.item_nbr = fcst_app.job_items.item_nbr
+                WHERE job_id = %s AND batch_id = %s
+            """, conn, params=(job_id, batch_id))
+            update_batch_status(batch_id, "Sales history obtained",cur)
+            return df_hist
+    except Exception as e:
+        update_batch_status(batch_id, "Obtaining sales history failed")
+        print(f"[FastAPI] Errorgetting sales history: {e}")
+    finally:
+        db_pool.putconn(conn)
 
-@router.post("/jobs/", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_job(job_request: JobRequest, background_tasks: BackgroundTasks):
-    """Create a new forecasting job (now async with background task)"""
-    job_id = f"job_{len(jobs_db) + 1}"
-    job = {
-        "job_id": job_id,
-        "status": JobStatus.QUEUED,
-        "created_at": datetime.utcnow(),
-        "user_id": job_request.user_id,
-        "forecast_horizon": job_request.forecast_horizon,
-        "items": job_request.items,
-        "items_count": len(job_request.items)
-    }
-    jobs_db[job_id] = job
-    print(f"[FastAPI] Job {job_id} created. Queued for background forecasting ({len(job_request.items)} items)...")
-    # Launch forecasting in the background
-    background_tasks.add_task(run_forecasting_background, job_id, job_request.dict())
-    return job
+def update_forecasts(forecasts):
+    """
+    Insert or update forecasts for all items in the batch into the database at once.
+    'forecasts' is a list of dicts as returned by forecast_one_item.
+    """
+    try:
+        conn = db_pool.getconn()
+        update_batch_status(batch_id, "Inserting forecast data", cur)
+        # Flatten all forecast results into a list of (item_nbr, wk_end_dt, forecast) tuples
+        forecast_rows = []
+        for item in forecasts:
+            if "forecast" in item and isinstance(item["forecast"], list):
+                for entry in item["forecast"]:
+                    forecast_rows.append((item["item_nbr"], entry["ds"], entry["yhat"]))
+            # Optionally log errors
+            elif "error" in item:
+                print(f"[FastAPI] Skipping forecast for item {item.get('item_nbr')}: {item['error']}")
 
+        if not forecast_rows:
+            print(f"[FastAPI] No forecasts to insert for batch {batch_id}")
+            return
+        with conn.cursor() as cur:
+            upsert_query = """
+                INSERT INTO fcst_app.forecasts 
+                (item_nbr, wk_end_dt, forecast)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (item_nbr, wk_end_dt) DO UPDATE
+                SET forecast = EXCLUDED.forecast
+            """
+            cur.executemany(upsert_query, forecast_rows)
+            conn.commit()
+            update_batch_status(batch_id, "Completed",cur)
+            print(f"[FastAPI] Inserted/updated {len(forecast_rows)} forecasts") 
+    except Exception as e:
+        update_batch_status(batch_id, "Inserting forecast data failed")
+        print(f"[FastAPI] Error updating forecasts: {e}")
+    finally:
+        db_pool.putconn(conn)
+        
 
-from fastapi.responses import JSONResponse
-
-@router.get("/jobs/{job_id}")
-async def get_job_status(job_id: str):
-    """Get the status of a specific job"""
-    if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job = jobs_db[job_id].copy()
-    # Convert datetime to isoformat string for JSON serialization
-    if isinstance(job.get("created_at"), datetime):
-        job["created_at"] = job["created_at"].isoformat()
-    # Convert all pandas.Timestamp in forecasts to ISO strings
-    if "forecasts" in job and isinstance(job["forecasts"], list):
-        for forecast in job["forecasts"]:
-            if "forecast" in forecast and isinstance(forecast["forecast"], list):
-                for entry in forecast["forecast"]:
-                    if "ds" in entry and hasattr(entry["ds"], "isoformat"):
-                        entry["ds"] = entry["ds"].isoformat()
-    return JSONResponse(content=job)
-
-@router.post("/jobs/{job_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
-async def cancel_job(job_id: str):
-    """Cancel a running job"""
-    if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs_db[job_id]
-    if job["status"] in [JobStatus.COMPLETED, JobStatus.FAILED]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot cancel job in {job['status']} state"
-        )
-    
-    job["status"] = JobStatus.STOPPED
-    # TODO: Implement actual cancellation logic
-    
-    return {"status": "cancellation requested"}
