@@ -35,6 +35,39 @@ This is the backend service for the cloud-based forecasting system, built with F
    # Edit .env with your configuration
    ```
 
+## How to Run the Backend Locally
+
+1. **Navigate to the backend directory:**
+   ```bash
+   cd backend_api
+   ```
+2. **(Optional) Create and activate a virtual environment:**
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. **Configure environment variables:**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your configuration
+   ```
+5. **Run the FastAPI server:**
+   ```bash
+   uvicorn main:app --reload
+   ```
+
+The API will be available at `http://localhost:8000`
+
+> **Troubleshooting:**
+> If you see an error like `Address already in use`, another process may be using port 8000. Either stop the other process or run the server on a different port:
+> ```bash
+> uvicorn main:app --reload --port 8001
+> ```
+
 ## Running the API
 
 ```bash

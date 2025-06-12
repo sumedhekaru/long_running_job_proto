@@ -11,30 +11,80 @@
     <button id="cancel-btn" class="btn btn-warning mt-3">Cancel Job</button>
     <script>
         const jobId = "{{ job_id }}";
-        document.getElementById('cancel-btn').onclick = async function() {
-            this.disabled = true;
-            document.getElementById('status').innerHTML = '<div>Cancellation requested...</div>';
-            await fetch(`/cancel/${jobId}`, {method: 'POST'});
-        };
+        let logCollapsed = true;
+        function formatLogEntry(msg, idx) {
+            // Try to extract a timestamp if present, else use now
+            let now = new Date();
+            let timeStr = now.toLocaleString();
+            // If message starts with timestamp, use it
+            let match = msg.match(/^(\d{4}-\d{2}-\d{2} \d{2}[:;]\d{2}[:;]\d{2}) (.+)$/);
+            if (match) {
+                timeStr = match[1].replace(/;/g, ':');
+                msg = match[2];
+            }
+            return `<div class="border-bottom px-2 py-1 small"><span class="text-secondary">${timeStr}</span> <span>${msg}</span></div>`;
+        }
+        function renderStatus(logArr) {
+            if (!Array.isArray(logArr) || logArr.length === 0) {
+                return '<div>Job submitted. Waiting for status...</div>';
+            }
+            let latestMsg = logArr[logArr.length - 1];
+            let latestHtml = formatLogEntry(latestMsg, logArr.length - 1);
+            let arrow = logCollapsed ? '▼' : '▲';
+            let collapseBtn = `<button id="toggle-log" class="btn btn-link p-0 ms-2" style="vertical-align:middle;">${arrow}</button>`;
+            let html = `<div class="d-flex align-items-center">${latestHtml}${collapseBtn}</div>`;
+            if (!logCollapsed) {
+                // Show all messages, oldest at bottom
+                let allLogs = logArr.map(formatLogEntry).join('');
+                html += `<div class="mt-2 border rounded bg-light">${allLogs}</div>`;
+            }
+            return html;
+        }
+        let statusLog = [];
         async function pollStatus() {
             while (true) {
-                const resp = await fetch(`/status/${jobId}`);
-                const data = await resp.json();
-                let logBlock = '';
-                if (Array.isArray(data.log) && data.log.length > 0) {
-                    logBlock = '<div>' + data.log[data.log.length - 1] + '</div>';
-                } else {
-                    logBlock = '<div>Job submitted. Waiting for status...</div>';
-                }
-                document.getElementById('status').innerHTML = logBlock;
-                if (["completed","failed","stopped"].includes(data.status)) {
-                    document.getElementById('cancel-btn').disabled = true;
+                try {
+                    const resp = await fetch(`/status/${jobId}`);
+                    if (!resp.ok) throw new Error("Network error");
+                    const data = await resp.json();
+                    if (data.error) {
+                        document.getElementById('status').innerHTML = `<div class='text-danger'>Error: ${data.error}</div>`;
+                        break;
+                    }
+                    if (data.latest_msg && (statusLog.length === 0 || statusLog[statusLog.length - 1] !== data.latest_msg)) {
+                        statusLog.push(data.latest_msg);
+                    }
+                    let summary = data.summary || '';
+document.getElementById('status').innerHTML = `<div class='mb-2 fw-bold'>${summary}</div>` + renderStatus(statusLog);
+                    let btn = document.getElementById('toggle-log');
+                    if (btn) {
+                        btn.onclick = function() {
+                            logCollapsed = !logCollapsed;
+                            let summary = data.summary || '';
+document.getElementById('status').innerHTML = `<div class='mb-2 fw-bold'>${summary}</div>` + renderStatus(statusLog);
+                        };
+                    }
+                    // Stop polling if all batches are completed (summary starts with 'X out of X batches completed')
+let allDone = false;
+if (data.summary) {
+    let match = data.summary.match(/^(\d+) out of (\d+) batches completed/);
+    if (match && match[1] === match[2]) {
+        allDone = true;
+    }
+}
+if (allDone || ["completed","failed","stopped"].includes(data.status)) {
+    document.getElementById('cancel-btn').disabled = true;
+    break;
+}
+                } catch (e) {
+                    document.getElementById('status').innerHTML = `<div class='text-danger'>Error fetching status: ${e}</div>`;
                     break;
                 }
                 await new Promise(r => setTimeout(r, 2000));
             }
         }
-        pollStatus();
+        document.addEventListener('DOMContentLoaded', pollStatus);
+
     </script>
     <a href="/" class="btn btn-secondary mt-3">Back to Home</a>
 </body>

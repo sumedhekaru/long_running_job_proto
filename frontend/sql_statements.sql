@@ -48,13 +48,29 @@ CREATE TABLE fcst_app.job_items (
     job_id      INTEGER NOT NULL,
     batch_id 	INTEGER not null,
     item_nbr    INTEGER NOT NULL,
-    PRIMARY KEY (job_id, item_nbr),
+    PRIMARY KEY (job_id, batch_id,item_nbr),
     FOREIGN KEY (job_id) REFERENCES fcst_app.forecast_request(job_id)
     -- Optionally: FOREIGN KEY (item_nbr) REFERENCES fcst_app.items(item_nbr)
 );
 
 
+CREATE TABLE fcst_app.batch_status (
+    batch_id    SERIAL PRIMARY KEY,    -- Globally unique batch ID
+    job_id      INTEGER NOT NULL,
+    status      TEXT NOT NULL,         -- e.g., 'queued', 'processing', 'completed', 'failed'
+    started_at  TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_msg   TEXT,
+    FOREIGN KEY (job_id) REFERENCES fcst_app.forecast_request(job_id)
+);
+
+--drop table fcst_app.batch_status
+
+select * from fcst_app.forecast_request
+
 select * from fcst_app.job_items
+
+select * from fcst_app.batch_status bs 
 
 --drop table fcst_app.job_items
 

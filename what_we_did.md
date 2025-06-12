@@ -65,4 +65,19 @@
     - Removed all legacy endpoints and in-memory job logic from the backend for clarity and maintainability.
     - The backend is now fully DB-driven, scalable, and ready for integration with the batch-oriented frontend.
 
+
+---
+
+## Step 7: Frontend Status UI and Job Tracking Enhancements (June 2025)
+- Enhanced the `/status/<job_id>` endpoint in the Flask frontend to:
+    - Aggregate and summarize the status of all batches for a job.
+    - Return a summary string (e.g., "12 out of 14 batches completed. 1 batch obtaining data, 1 batch inserting data") and a status breakdown dictionary.
+    - Print each response to the console for easier debugging.
+- Updated the frontend job status page (`job.html`):
+    - The main status area now displays the summary string from the backend, giving users a high-level view of job progress.
+    - The collapsible log below the summary continues to accumulate and display all batch status messages.
+    - Polling for status updates now stops automatically when all batches are completed (by parsing the summary string for "X out of X batches completed").
+    - After job submission, the frontend redirects to `/job/<job_id>` so the browser URL always matches the job status page, enabling bookmarking and sharing.
+- These improvements provide a much clearer, more user-friendly experience for monitoring and tracking multi-batch forecasting jobs.
+
 Further steps and decisions will be documented here as the project progresses.

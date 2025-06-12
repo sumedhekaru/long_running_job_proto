@@ -80,7 +80,7 @@ def index():
                 results.append({"batch_id": batch_id, "error": str(e)})
                 break  # Stop submitting further batches on error
         flash(f"Created job {job_id} with items: {item_nbrs}. Batch submission results: {results}", "success")
-        return render_template("job.html", job_id=job_id, item_nbrs=item_nbrs, batch_results=results)
+        return redirect(url_for("job_status", job_id=job_id))
 
     return render_template("index.html")
 
@@ -91,15 +91,43 @@ def job_status(job_id):
 @app.route("/status/<job_id>")
 def status(job_id):
     try:
-        resp = requests.get(f"{BACKEND_URL}{job_id}")
-        resp.raise_for_status()
-        job = resp.json()
-        # Pass through all relevant fields for frontend progress/log display
-        return jsonify({
-            "status": job.get("status"),
-            "progress": job.get("progress"),
-            "log": job.get("log"),
-        })
+        with engine.connect() as conn:
+            # Get all batches for this job
+            rows = conn.execute(text("""
+                SELECT batch_id, status, updated_at
+                FROM fcst_app.batch_status
+                WHERE job_id = :job_id
+                ORDER BY batch_id ASC
+            """), {"job_id": job_id}).mappings().fetchall()
+            total = len(rows)
+            if total == 0:
+                summary = "No batches found"
+                status_val = "unknown"
+                latest_msg = "No status found"
+                status_breakdown = {}
+            else:
+                # Count completed and breakdown by status
+                completed_statuses = {"completed", "failed"}
+                finished = sum(1 for r in rows if r['status'].lower() in completed_statuses)
+                status_counts = {}
+                for r in rows:
+                    s = r['status'].lower()
+                    status_counts[s] = status_counts.get(s, 0) + 1
+                summary = f"{finished} out of {total} batches completed. "
+                summary += ", ".join(f"{count} batch{'es' if count > 1 else ''} {status}" for status, count in status_counts.items() if status not in completed_statuses)
+                # Latest message is the most recently updated batch
+                latest_row = max(rows, key=lambda r: r['updated_at'])
+                latest_msg = f"{latest_row['updated_at'].strftime('%Y-%m-%d %H:%M:%S')} Batch {latest_row['batch_id']}: {latest_row['status']}"
+                status_val = latest_row['status']
+                status_breakdown = status_counts
+            response = {
+                "status": status_val,
+                "latest_msg": latest_msg,
+                "summary": summary,
+                "status_breakdown": status_breakdown,
+            }
+            print(f"[DEBUG] /status/{job_id} response: {response}")
+            return jsonify(response)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
