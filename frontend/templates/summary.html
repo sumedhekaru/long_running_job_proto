@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Job Summary{% endblock %}
+{% block content %}
+<table class="table table-striped table-bordered">
+    <thead class="table-dark">
+        <tr>
+            <th>Job ID</th>
+            <th>Number of Items</th>
+            <th>Submitted At (Start)</th>
+            <th>Updated At (End)</th>
+            <th>Total Elapsed Time (s)</th>
+            <th>Time per Item (s)</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for r in jobs %}
+        <tr>
+            <td>{{ r.job_id }}</td>
+            <td>{{ r.num_items }}</td>
+            <td>{{ r.start_time }}</td>
+            <td>{{ r.end_time }}</td>
+            <td>{{ '%.2f'|format(r.elapsed) if r.elapsed is not none else '' }}</td>
+            <td>{{ '%.2f'|format(r.time_per_item) if r.time_per_item is not none else '' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

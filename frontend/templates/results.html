@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Results Visualization{% endblock %}
+{% block extra_head %}<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>{% endblock %}
+{% block content %}
+<h2>Results Visualization</h2>
+<div class="mb-3 row">
+    <label for="job-id" class="col-sm-2 col-form-label">Job ID</label>
+    <div class="col-sm-4">
+        <input type="text" class="form-control" id="job-id" placeholder="Enter Job ID" value="{{ job_id or '' }}">
+    </div>
+    <div class="col-sm-2">
+        <button id="fetch-items" class="btn btn-primary">Load Items</button>
+    </div>
+</div>
+<div class="mb-3 row">
+    <label for="item-select" class="col-sm-2 col-form-label">Select Item</label>
+    <div class="col-sm-4">
+        <select class="form-select" id="item-select" {% if not item_ids %}disabled{% endif %}>
+            {% if item_ids %}
+                {% for item in item_ids %}
+                    <option value="{{ item }}" {% if loop.first %}selected{% endif %}>{{ item }}</option>
+                {% endfor %}
+            {% else %}
+                <option value="">Select an item</option>
+            {% endif %}
+        </select>
+    </div>
+</div>
+<div id="plot-container" class="mt-4">
+    <div id="plotly-chart" style="height:400px;"></div>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script>
+    // If job_id and item_ids are provided, plot the first item automatically
+    const jobId = {{ job_id|tojson }};
+    const itemIds = {{ item_ids|tojson }};
+    const firstItemHist = {{ first_item_hist|tojson }};
+    const firstItemFcst = {{ first_item_fcst|tojson }};
+    if (jobId && itemIds.length > 0 && firstItemHist.length > 0 && firstItemFcst.length > 0) {
+        const plotDiv = document.getElementById('plotly-chart');
+        const histTrace = {
+            x: firstItemHist.map(d => d.ds),
+            y: firstItemHist.map(d => d.y),
+            mode: 'lines+markers',
+            name: 'Historical',
+            line: {color: '#1f77b4'}
+        };
+        const fcstTrace = {
+            x: firstItemFcst.map(d => d.ds),
+            y: firstItemFcst.map(d => d.yhat),
+            mode: 'lines+markers',
+            name: 'Forecast',
+            line: {color: '#ff7f0e', dash: 'dash'}
+        };
+        Plotly.newPlot(plotDiv, [histTrace, fcstTrace], {
+            title: `Item ${itemIds[0]}: Historical & Forecast`,
+            xaxis: {title: 'Week Ending'},
+            yaxis: {title: 'Sales'},
+            legend: {orientation: 'h', x: 0.2, y: 1.15},
+            margin: {t: 50}
+        }, {responsive: true});
+    }
+</script>
+<script src="/static/results.js"></script>
+{% endblock %}

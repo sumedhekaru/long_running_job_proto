@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Recent Jobs{% endblock %}
+{% block content %}
+    <h2>Recent Jobs</h2>
+    <ul class="list-group mb-3">
+      {% for job in jobs %}
+        <li class="list-group-item d-flex justify-content-between align-items-center">
+          <a href="/results?job_id={{ job.job_id }}">Job {{ job.job_id }}</a>
+          <span class="badge bg-info text-dark">{{ job.status }}</span>
+          <span class="text-muted small">{{ job.submitted_at }}</span>
+        </li>
+      {% else %}
+        <li class="list-group-item">No jobs found.</li>
+      {% endfor %}
+    </ul>
+    <a href="/" class="btn btn-secondary">Back to Home</a>
+{% endblock %}

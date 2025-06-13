@@ -23,7 +23,7 @@ set -e
 # gcloud auth configure-docker "$REGION-docker.pkg.dev"
 
 # Step 2: Build Docker image
-docker build -t "$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/$IMAGE_NAME" .
+docker build --no-cache -t "$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/$IMAGE_NAME" .
 
 # Step 3: Tag the Docker image (to ensure latest version)
 docker tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/$IMAGE_NAME" "$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/$IMAGE_NAME:latest"
@@ -36,6 +36,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --image="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/$IMAGE_NAME:latest" \
   --platform=managed \
   --region="$REGION" \
-  --allow-unauthenticated
+  --allow-unauthenticated 
+  #--no-cpu-throttling
 
 echo "Deployment complete!"

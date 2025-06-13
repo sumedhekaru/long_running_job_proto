@@ -8,7 +8,11 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
 from dotenv import load_dotenv
+from prophet import Prophet
+import numpy as np
+from pandas import Timestamp
 load_dotenv()
+
 
 router = APIRouter()
 
@@ -21,8 +25,8 @@ print("DATABASE_URL:", os.getenv("DATABASE_URL"))
 def forecast_one_item(item, forecast_horizon):
     """
     Run Prophet forecasting for a single item. Expects item dict with 'item_nbr' and 'history'.
+    Returns a DataFrame with columns ["ds", "yhat", "item_nbr"].
     """
-    from prophet import Prophet
     item_id = item["item_nbr"]
     history = item["history"]
     start = time.time()
@@ -30,36 +34,40 @@ def forecast_one_item(item, forecast_horizon):
     df["ds"] = pd.to_datetime(df["ds"])
     df = df.sort_values("ds")
     print(f"[FastAPI] Forecasting item {item_id} with {len(df)} data points.")
-    model = Prophet(yearly_seasonality=False)
+    yearly_seasonality = len(df) >= 104
+    weekly_seasonality = len(df) >= 30
+    model = Prophet(yearly_seasonality=yearly_seasonality, weekly_seasonality=weekly_seasonality)
     model.fit(df)
-    future = model.make_future_dataframe(periods=forecast_horizon)
+    future = model.make_future_dataframe(periods=forecast_horizon, freq='W')
     forecast = model.predict(future)
     forecast_needed = forecast.tail(forecast_horizon)[["ds", "yhat"]]
+    forecast_needed["yhat"] = forecast_needed["yhat"].clip(lower=0)
+    forecast_needed["item_nbr"] = item_id
     duration = time.time() - start
     print(f"[FastAPI] Forecast for item {item_id} took {duration:.2f} seconds.")
-    return {
-        "item_nbr": item_id,
-        "forecast": forecast_needed.to_dict(orient="records")
-    }
-    
+    return forecast_needed
+
 def update_batch_status(batch_id, status, conn=None):
     """
     Update the status of a batch in the database using the connection pool.
+    Ensures connections are always returned to the pool.
     """
     new_conn = False
     if conn is None:
         new_conn = True
         conn = db_pool.getconn()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE fcst_app.batch_status
-        SET status = %s, updated_at = NOW()
-        WHERE batch_id = %s
-    """, (status, batch_id))
-    conn.commit()
-    cursor.close()
-    if new_conn:
-        db_pool.putconn(conn)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE fcst_app.batch_status
+            SET status = %s, updated_at = NOW()
+            WHERE batch_id = %s
+        """, (status, batch_id))
+        conn.commit()
+        cursor.close()
+    finally:
+        if new_conn:
+            db_pool.putconn(conn)
 
 
 
@@ -87,49 +95,72 @@ async def submit_batch(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok", "job_id": job_id, "batch_id": batch_id}
 
 
-def process_batch_forecasting(job_id, batch_id, forecast_horizon):
+def update_job_status_if_complete(job_id, conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM fcst_app.batch_status
+            WHERE job_id = %s AND status NOT IN ('Completed', 'Failed')
+        """, (job_id,))
+        remaining = cur.fetchone()[0]
+        if remaining == 0:
+            print(f"[FastAPI] All batches for job {job_id} completed.")
+            cur.execute("""
+                UPDATE fcst_app.forecast_request
+                SET status = 'completed', updated_at = NOW()
+                WHERE job_id = %s
+            """, (job_id,))
+            conn.commit()
+
+def is_job_cancelled(job_id, conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT status FROM fcst_app.forecast_request WHERE job_id = %s
+        """, (job_id,))
+        row = cur.fetchone()
+        if row and row[0] and row[0].lower() == "cancelled":
+            print(f"[FastAPI] Job {job_id} is cancelled.")
+            return True
+        return False
+
+def update_job_batch(job_id, batch_id, msg, conn=None):
+    new_conn = False
+    if conn is None:
+        conn = db_pool.getconn()
+        new_conn = True
     try:
-        # 1. Get sales history for all items in the batch
-        df_hist = get_sales_history(job_id, batch_id)
+        update_batch_status(batch_id, msg, conn)
+        update_job_status_if_complete(job_id, conn)
+    finally:
+        if new_conn:
+            db_pool.putconn(conn)
 
-        # Prepare batch items for parallel processing
-        batch_items = []
-        for item_nbr in df_hist["item_nbr"].unique():
-            item_hist = df_hist[df_hist["item_nbr"] == item_nbr][["ds", "y"]]
-            history = item_hist.to_dict(orient="records")
-            batch_items.append({"item_nbr": item_nbr, "history": history})
+def batch_forecast(df_hist, forecast_horizon):
+    dfs = []
+    for item_id, item_hist in df_hist.groupby("item_nbr"):
+        item = {"item_nbr": item_id, "history": item_hist[["ds", "y"]].to_dict(orient="records")}
+        try:
+            fcst_df = forecast_one_item(item, forecast_horizon)
+            dfs.append(fcst_df)
+        except Exception as e:
+            print(f"[FastAPI] Error forecasting item {item_id}: {e}")
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    else:
+        return pd.DataFrame()
 
-        print(f"[FastAPI] Running parallel forecasting for batch {batch_id}...")
-        import concurrent.futures
-        forecasts = []
-        num_workers = min(os.cpu_count() or 1, len(batch_items))
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            future_to_item = {
-                executor.submit(forecast_one_item, item, forecast_horizon): item["item_nbr"]
-                for item in batch_items
-            }
-            for future in concurrent.futures.as_completed(future_to_item):
-                item_nbr = future_to_item[future]
-                try:
-                    result = future.result()
-                    forecasts.append(result)
-                except Exception as e:
-                    print(f"[FastAPI] Forecast failed for item {item_nbr}: {e}")
-                    forecasts.append({"item_nbr": item_nbr, "error": str(e)})
-
-        update_batch_status(batch_id, "Completed")
-        print(f"[FastAPI] Completed forecasting for batch {batch_id}.")
-
-        update_forecasts(forecasts, batch_id)
-    except Exception as e:
-        update_batch_status(batch_id, "Failed")
-        print(f"[FastAPI] Error forecasting for batch {batch_id}: {e}")
-
+def process_batch_forecasting(job_id, batch_id, forecast_horizon):
+    print(f"[FastAPI] Starting forecasting for batch {batch_id}...")
+    df_hist = get_sales_history(job_id, batch_id)
+    if df_hist is None or df_hist.empty:
+        update_job_batch(job_id, batch_id, "No sales history")
+        return
+    forecasts_df = batch_forecast(df_hist, forecast_horizon)
+    print(f"[FastAPI] Updating forecasts for batch {batch_id}...")
+    update_forecasts(forecasts_df, batch_id, job_id)
 
 def get_sales_history(job_id, batch_id):
-    conn = None
+    conn = db_pool.getconn()
     try:
-        conn = db_pool.getconn()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             update_batch_status(batch_id, "Obtaining sales history", conn)
             df_hist = pd.read_sql("""
@@ -139,70 +170,50 @@ def get_sales_history(job_id, batch_id):
                   ON sales.item_nbr = job_items.item_nbr
                 WHERE job_items.job_id = %s AND job_items.batch_id = %s
             """, conn, params=(job_id, batch_id))
-            update_batch_status(batch_id, "Sales history obtained", conn)
+            update_batch_status(batch_id, "Sales history obtained")
             return df_hist
     except Exception as e:
-        if conn is not None:
-            update_batch_status(batch_id, "Obtaining sales history failed", conn)
+        update_job_batch(job_id, batch_id, "Obtaining sales history failed")
         print(f"[FastAPI] Error getting sales history: {e}")
     finally:
-        if conn is not None:
-            db_pool.putconn(conn)
+        db_pool.putconn(conn)
 
 
-def update_forecasts(forecasts, batch_id):
+def update_forecasts(forecasts_df, batch_id, job_id):
     """
     Insert or update forecasts for all items in the batch into the database at once.
-    'forecasts' is a list of dicts as returned by forecast_one_item.
+    forecasts_df is a DataFrame with columns ["item_nbr", "ds", "yhat"].
+    Uses a single DB connection for all operations in this function.
     """
+    conn = db_pool.getconn()
     try:
-        conn = db_pool.getconn()
-        update_batch_status(batch_id, "Inserting forecast data", conn)
-        # Flatten all forecast results into a list of (item_nbr, wk_end_dt, forecast) tuples
-        forecast_rows = []
-        import numpy as np
-        from pandas import Timestamp
-        def make_sql_serializable(obj):
-            if isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return round(float(obj), 1)
-            elif isinstance(obj, float):
-                return round(obj, 1)
-            elif isinstance(obj, Timestamp):
-                return obj.to_pydatetime()
-            else:
-                return obj
-        for item in forecasts:
-            if "forecast" in item and isinstance(item["forecast"], list):
-                for entry in item["forecast"]:
-                    row = (
-                        make_sql_serializable(item["item_nbr"]),
-                        make_sql_serializable(entry["ds"]),
-                        round(make_sql_serializable(entry["yhat"]), 1)
-                    )
-                    forecast_rows.append(row)
-            # Optionally log errors
-            elif "error" in item:
-                print(f"[FastAPI] Skipping forecast for item {item.get('item_nbr')}: {item['error']}")
-
-        if not forecast_rows:
-            print(f"[FastAPI] No forecasts to insert for batch {batch_id}")
+        if is_job_cancelled(job_id, conn):
+            update_batch_status(batch_id, "Cancelled", conn)
             return
+
+        update_batch_status(batch_id, "Inserting forecast data", conn)
+        forecast_rows = [
+            (row.item_nbr, row.ds, row.yhat)
+            for row in forecasts_df.itertuples()
+            if hasattr(row, "yhat")
+        ]
         with conn.cursor() as cur:
             upsert_query = """
-                INSERT INTO fcst_app.forecasts 
-                (item_nbr, wk_end_dt, forecast)
+                INSERT INTO fcst_app.forecasts (item_nbr, wk_end_dt, forecast)
                 VALUES (%s, %s, %s)
                 ON CONFLICT (item_nbr, wk_end_dt) DO UPDATE
                 SET forecast = EXCLUDED.forecast
             """
-            cur.executemany(upsert_query, forecast_rows)
-            conn.commit()
-            update_batch_status(batch_id, "Completed",conn)
-            print(f"[FastAPI] Inserted/updated {len(forecast_rows)} forecasts") 
+            if forecast_rows:
+                cur.executemany(upsert_query, forecast_rows)
+                conn.commit()
+                update_job_batch(job_id, batch_id, "Completed", conn)
+                print(f"[FastAPI] Inserted/updated {len(forecast_rows)} forecasts")
+            else:
+                update_job_batch(job_id, batch_id, "No valid forecasts", conn)
+                print(f"[FastAPI] No valid forecasts to insert for batch {batch_id}")
     except Exception as e:
-        update_batch_status(batch_id, "Inserting forecast data failed", conn)
+        update_job_batch(job_id, batch_id, "Inserting forecast data failed", conn)
         print(f"[FastAPI] Error updating forecasts: {e}")
     finally:
         db_pool.putconn(conn)

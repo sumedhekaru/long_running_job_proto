@@ -1,11 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Job Submitted</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
-</head>
-<body class="container py-5">
+{% extends "base.html" %}
+{% block title %}Job Submitted{% endblock %}
+{% block content %}
     <h1>Job Submitted</h1>
     <div class="alert alert-success">
         <strong>Job ID:</strong> {{ job.job_id }}<br>
@@ -13,5 +8,4 @@
         <strong>Created At:</strong> {{ job.created_at }}
     </div>
     <a href="/" class="btn btn-secondary">Submit Another Job</a>
-</body>
-</html>
+{% endblock %}
