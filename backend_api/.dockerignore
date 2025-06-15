@@ -4,7 +4,9 @@ __pycache__/
 *.pyd
 .Python
 env/
+.env
 .venv/
+venv
 build/
 dist/
 .git/
@@ -15,3 +17,4 @@ dist/
 *.csv
 *.ipynb
 .DS_Store
+long-running-forecast-fdc4666f3815.json

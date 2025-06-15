@@ -1,14 +1,23 @@
+from cgi import test
 import os
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-
+from google.cloud import pubsub_v1  
+import json
+from flask import request, flash, redirect, url_for, render_template
+from sqlalchemy import text
+import time
+import requests
+import uuid
 # Load environment variables
 load_dotenv()
 
-#BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000/jobs/")
+pubsub = True
+
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000/jobs/")
 #BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8080/jobs/")
-BACKEND_URL = os.getenv("BACKEND_URL", "https://backend-api-855648496281.us-east4.run.app/jobs/")
+#BACKEND_URL = os.getenv("BACKEND_URL", "https://backend-api-855648496281.us-east4.run.app/jobs/")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
@@ -17,82 +26,125 @@ print("DATABASE_URL:", DATABASE_URL)
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "dev")
 
+PUBSUB_TOPIC = os.getenv("PUBSUB_TOPIC")
+publisher = pubsub_v1.PublisherClient()
+forecast_horizon = os.getenv("FORECAST_HORIZON", 30)
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
-        import requests
+        t_start = time.time()
         num_items = int(request.form.get("num_items", 1))
-        user_id = "test_user"  # In production, get from session/auth
-        batch_size = 10  # Number of items per batch
-        batch_ids = []   # To store all created batch IDs
+        user_id = "test_user"  # Replace with actual user context
+        batch_size = 50
+        batch_ids = []
 
         with engine.begin() as conn:
-            # 1. Select N random items
-            print(f"Selecting {num_items} random items from items table...")
-            item_rows = conn.execute(text("""
-                SELECT item_nbr FROM fcst_app.items ORDER BY RANDOM() LIMIT :num_items
-            """), {"num_items": num_items}).fetchall()
-            item_nbrs = [row[0] for row in item_rows]
-            print(f"Selected item_nbrs: {item_nbrs}")
-
-            # 2. Create a new job
-            print("Creating new forecast_request job...")
+            # 1. Create forecast_request job
             job_row = conn.execute(text("""
-                INSERT INTO fcst_app.forecast_request (user_id, num_items) VALUES (:user_id, :num_items)
+                INSERT INTO fcst_app.forecast_request (user_id, num_items)
+                VALUES (:user_id, :num_items)
                 RETURNING job_id
             """), {"user_id": user_id, "num_items": num_items}).fetchone()
             job_id = job_row[0]
-            print(f"Created job_id: {job_id}")
+            print(f"[INFO] Created job_id: {job_id}")
 
-            # 3. Create all batches up front and get their batch_ids
-            batches = [item_nbrs[i:i+batch_size] for i in range(0, len(item_nbrs), batch_size)]
-            for batch_items in batches:
-                # Insert into batch_status to get a globally unique batch_id
-                batch_status_row = conn.execute(text("""
-                    INSERT INTO fcst_app.batch_status (job_id, status) VALUES (:job_id, :status)
+            # 2. Create temp_items with batch numbers
+            temp_items_table = f"temp_items_{uuid.uuid4().hex[:8]}"
+            conn.execute(text(f"DROP TABLE IF EXISTS {temp_items_table}"))
+            conn.execute(text(f"""
+                SELECT item_nbr,
+                       row_number() OVER (ORDER BY rand) AS row_num,
+                       CEIL(row_number() OVER (ORDER BY rand) / CAST(:batch_size AS FLOAT)) AS temp_batch_num
+                INTO TEMP TABLE {temp_items_table}
+                FROM (
+                    SELECT item_nbr, RANDOM() AS rand
+                    FROM fcst_app.items
+                    ORDER BY rand
+                    LIMIT :num_items
+                ) sub
+            """), {"num_items": num_items, "batch_size": batch_size})
+
+            # 3. Create batch_map with real batch_ids
+            batch_map_table = f"batch_map_{uuid.uuid4().hex[:8]}"
+            conn.execute(text(f"DROP TABLE IF EXISTS {batch_map_table}"))
+            conn.execute(text(f"""
+                CREATE TEMP TABLE {batch_map_table} AS
+                WITH ins AS (
+                    INSERT INTO fcst_app.batch_status (job_id, status, started_at, updated_at)
+                    SELECT :job_id, 'queued', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    FROM (SELECT DISTINCT temp_batch_num FROM {temp_items_table}) t
                     RETURNING batch_id
-                """), {"job_id": job_id, "status": "queued"}).fetchone()
-                batch_id = batch_status_row[0]
-                batch_ids.append(batch_id)
-                print(f"Created batch_id: {batch_id} for items: {batch_items}")
-                # Insert items for this batch into job_items
-                job_items = [
-                    {"job_id": job_id, "batch_id": batch_id, "item_nbr": item_nbr}
-                    for item_nbr in batch_items
-                ]
-                conn.execute(
-                    text("INSERT INTO fcst_app.job_items (job_id, batch_id, item_nbr) VALUES (:job_id, :batch_id, :item_nbr)"),
-                    job_items
                 )
+                SELECT batch_id,
+                       ROW_NUMBER() OVER (ORDER BY batch_id) AS temp_batch_num
+                FROM ins
+            """), {"job_id": job_id})
 
-        # 4. Submit the batches one by one to the backend, waiting for each to finish
-        print(f"Submitting {len(batch_ids)} batches to backend one by one...")
+            # 4. Insert into job_items by joining batch_map
+            conn.execute(text(f"""
+                INSERT INTO fcst_app.job_items (job_id, batch_id, item_nbr)
+                SELECT :job_id, bm.batch_id, ti.item_nbr
+                FROM {temp_items_table} ti
+                JOIN {batch_map_table} bm ON ti.temp_batch_num = bm.temp_batch_num
+            """), {"job_id": job_id})
+
+            # 5. Extract batch_ids to submit
+            batch_id_rows = conn.execute(text(f"SELECT batch_id FROM {batch_map_table}")).fetchall()
+            batch_ids = [row[0] for row in batch_id_rows]
+
+            # Optional cleanup
+            conn.execute(text(f"DROP TABLE IF EXISTS {temp_items_table}"))
+            conn.execute(text(f"DROP TABLE IF EXISTS {batch_map_table}"))
+
+        # 6. Submit batches (via REST or Pub/Sub)
         results = []
+        print(f"[INFO] Submitting {len(batch_ids)} batches...")
         for idx, batch_id in enumerate(batch_ids):
-            print(f"Submitting batch {idx+1}/{len(batch_ids)} (batch_id={batch_id}) to backend...")
+            print(f"[INFO] Submitting batch {idx+1}/{len(batch_ids)} (batch_id={batch_id})...")
             try:
-                resp = requests.post(f"{BACKEND_URL}batch", json={"job_id": job_id, "batch_id": batch_id})
-                print(f"Backend response status: {resp.status_code}")
-                resp.raise_for_status()
-                result = resp.json()
-                print(f"Batch {batch_id} result: {result}")
-                results.append(result)
+                if pubsub:
+                    submit_job_to_pubsub(job_id, batch_id, forecast_horizon)
+                else:
+                    resp = requests.post(f"{BACKEND_URL}batch", json={"job_id": job_id, "batch_id": batch_id})
+                    resp.raise_for_status()
+                    results.append(resp.json())
             except Exception as e:
-                print(f"Error submitting batch {batch_id}: {e}")
+                print(f"[ERROR] Batch {batch_id} failed: {e}")
                 results.append({"batch_id": batch_id, "error": str(e)})
-                break  # Stop submitting further batches on error
-        flash(f"Created job {job_id} with items: {item_nbrs}. Batch submission results: {results}", "success")
+                break  # Stop submitting on first failure
+
+        flash(f"Created job {job_id}. Batch results: {results}", "success")
         return redirect(url_for("job_status", job_id=job_id))
 
-    # Fetch last 10 jobs for navigation
-    jobs = []
+    # For GET: show recent jobs
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT job_id, status, submitted_at FROM fcst_app.forecast_request
-            ORDER BY job_id DESC LIMIT 10
+            SELECT job_id, status, submitted_at
+            FROM fcst_app.forecast_request
+            ORDER BY job_id DESC
+            LIMIT 10
         """)).fetchall()
         jobs = [{"job_id": r[0], "status": r[1], "submitted_at": r[2]} for r in rows]
     return render_template("index.html", jobs=jobs)
+
+
+
+def submit_job_to_pubsub(job_id, batch_id, forecast_horizon):
+    t_pubsub_start = time.time()
+    message = {
+        "job_id": job_id,
+        "batch_id": batch_id,
+        "forecast_horizon": forecast_horizon
+    }
+    data = json.dumps(message).encode("utf-8")
+    topic_path = PUBSUB_TOPIC
+    print(f"[TIMER] Before Pub/Sub publish: {time.time() - t_pubsub_start:.4f}s")
+    future = publisher.publish(topic_path, data)
+    print(f"[TIMER] After Pub/Sub publish: {time.time() - t_pubsub_start:.4f}s")
+    return True
+    #return future.result()
+        
 
 @app.route("/job/")
 def job_list():
@@ -144,16 +196,20 @@ def results():
 def summary():
     with engine.begin() as conn:
         jobs = conn.execute(text('''
-            SELECT 
-                job_id, 
-                num_items, 
-                submitted_at AS start_time, 
-                updated_at AS end_time, 
-                EXTRACT(EPOCH FROM (updated_at - submitted_at)) AS elapsed,
-                CASE WHEN num_items > 0 THEN EXTRACT(EPOCH FROM (updated_at - submitted_at))/num_items ELSE NULL END AS time_per_item
-            FROM fcst_app.forecast_request
-            WHERE status = 'completed'  
-            ORDER BY submitted_at DESC
+            SELECT fr.job_id, 
+                   fr.num_items, 
+                   fr.submitted_at AS start_time, 
+                   EXTRACT(EPOCH FROM (MAX(bs.updated_at) - fr.submitted_at)) AS elapsed,
+                   CASE WHEN fr.num_items > 0 THEN EXTRACT(EPOCH FROM (MAX(bs.updated_at) - fr.submitted_at))/fr.num_items ELSE NULL END AS time_per_item,
+                   COALESCE(SUM(bs.secs_get_data), 0) AS sum_get,
+                   COALESCE(SUM(bs.secs_forecast), 0) AS sum_fcst,
+                   COALESCE(SUM(bs.secs_insert), 0) AS sum_ins,
+                   COUNT(bs.batch_id) AS num_batches
+            FROM fcst_app.forecast_request fr
+            LEFT JOIN fcst_app.batch_status bs ON fr.job_id = bs.job_id
+            WHERE fr.status = 'completed'
+            GROUP BY fr.job_id, fr.num_items, fr.submitted_at
+            ORDER BY fr.submitted_at DESC
             LIMIT 30
         ''')).fetchall()
     return render_template(
@@ -207,7 +263,6 @@ def api_itemdata(job_id, item_nbr):
 def status(job_id):
     try:
         with engine.connect() as conn:
-            # Get all batches for this job
             rows = conn.execute(text("""
                 SELECT batch_id, status, updated_at
                 FROM fcst_app.batch_status
@@ -216,20 +271,25 @@ def status(job_id):
             """), {"job_id": job_id}).mappings().fetchall()
             total = len(rows)
             if total == 0:
-                summary = "No batches found"
+                summary = "No batches found."
                 status_val = "unknown"
-                latest_msg = "No status found"
+                latest_msg = "No status found."
                 status_breakdown = {}
             else:
-                # Count completed and breakdown by status
-                completed_statuses = {"completed", "failed"}
-                finished = sum(1 for r in rows if r['status'].lower() in completed_statuses)
                 status_counts = {}
                 for r in rows:
-                    s = r['status'].lower()
+                    s = r['status']
                     status_counts[s] = status_counts.get(s, 0) + 1
-                summary = f"{finished} out of {total} batches completed. "
-                summary += ", ".join(f"{count} batch{'es' if count > 1 else ''} {status}" for status, count in status_counts.items() if status not in completed_statuses)
+                # Only count 'completed' as finished (customize if needed)
+                completed_statuses = {"completed"}
+                finished = sum(count for status, count in status_counts.items() if status.lower() in completed_statuses)
+                summary = f"{finished} out of {total} batches completed."
+                # Add all statuses regardless of value, with count
+                details = []
+                for status, count in status_counts.items():
+                    details.append(f"{count} {status}")
+                if details:
+                    summary += " " + ", ".join(details) + "."
                 # Latest message is the most recently updated batch
                 latest_row = max(rows, key=lambda r: r['updated_at'])
                 latest_msg = f"{latest_row['updated_at'].strftime('%Y-%m-%d %H:%M:%S')} Batch {latest_row['batch_id']}: {latest_row['status']}"

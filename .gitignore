@@ -82,3 +82,4 @@ forecast_data/
 # Ignore compiled Prophet models
 *.stan
 deploy.sh
+long-running-forecast-fdc4666f3815.json

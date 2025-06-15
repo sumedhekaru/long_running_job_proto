@@ -7,9 +7,12 @@
             <th>Job ID</th>
             <th>Number of Items</th>
             <th>Submitted At (Start)</th>
-            <th>Updated At (End)</th>
+            <th>Num Batches</th>
             <th>Total Elapsed Time (s)</th>
             <th>Time per Item (s)</th>
+            <th>Sum Get (s)</th>
+            <th>Sum Fcst (s)</th>
+            <th>Sum Ins (s)</th>
         </tr>
     </thead>
     <tbody>
@@ -18,9 +21,12 @@
             <td>{{ r.job_id }}</td>
             <td>{{ r.num_items }}</td>
             <td>{{ r.start_time }}</td>
-            <td>{{ r.end_time }}</td>
+            <td>{{ r.num_batches }}</td>
             <td>{{ '%.2f'|format(r.elapsed) if r.elapsed is not none else '' }}</td>
             <td>{{ '%.2f'|format(r.time_per_item) if r.time_per_item is not none else '' }}</td>
+            <td>{{ '%.2f'|format(r.sum_get) if r.sum_get is not none else '' }}</td>
+            <td>{{ '%.2f'|format(r.sum_fcst) if r.sum_fcst is not none else '' }}</td>
+            <td>{{ '%.2f'|format(r.sum_ins) if r.sum_ins is not none else '' }}</td>
         </tr>
         {% endfor %}
     </tbody>

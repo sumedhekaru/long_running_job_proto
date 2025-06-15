@@ -33,6 +33,8 @@ CREATE TABLE fcst_app.forecasts (
     PRIMARY KEY (item_nbr, wk_end_dt)
 );
 
+-- delete from fcst_app.forecasts where 1=1
+
 CREATE TABLE fcst_app.forecast_request (
     job_id              SERIAL PRIMARY KEY,
     user_id         VARCHAR(64),       -- Or INTEGER, depending on your user management
@@ -41,6 +43,8 @@ CREATE TABLE fcst_app.forecast_request (
     num_items       INTEGER,            -- Number of items requested in the job
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- delete from fcst_app.forecast_request where 1=1
 
 select * from fcst_app.forecast_request fr 
 
@@ -53,6 +57,7 @@ CREATE TABLE fcst_app.job_items (
     -- Optionally: FOREIGN KEY (item_nbr) REFERENCES fcst_app.items(item_nbr)
 );
 
+-- delete from fcst_app.job_items where 1=1
 
 CREATE TABLE fcst_app.batch_status (
     batch_id    SERIAL PRIMARY KEY,    -- Globally unique batch ID
@@ -64,16 +69,27 @@ CREATE TABLE fcst_app.batch_status (
     FOREIGN KEY (job_id) REFERENCES fcst_app.forecast_request(job_id)
 );
 
+-- delete from fcst_app.batch_status where 1=1
+
+ALTER TABLE fcst_app.batch_status
+ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
+
 --drop table fcst_app.batch_status
 
 select * from fcst_app.forecast_request
 
 select * from fcst_app.job_items
 
-select * from fcst_app.batch_status bs 
+select * from fcst_app.batch_status bs where job_id = 53
+
+
+select * from fcst_app.forecasts f 
 
 --drop table fcst_app.job_items
 
+--delete from fcst_app.forecasts where 1=1
+
+SELECT * FROM fcst_app.batch_status WHERE job_id = 89
 
 -- Index for fast lookup by job
 CREATE INDEX idx_job_items_job_id ON fcst_app.job_items(job_id);
